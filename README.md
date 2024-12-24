@@ -8,4 +8,4 @@ Litreature Reviews:
 2. Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations
 
 
-Results of the Code executed are there in Wiki
+Results of the Code executed is there in Wiki
