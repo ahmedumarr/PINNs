@@ -6,3 +6,6 @@ Practised Python codes for PINN:
 Litreature Reviews:
 1.Solving the wave equation with physics-informed deep learning
 2. Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations
+
+
+Results of the Code executed are there in Wiki
