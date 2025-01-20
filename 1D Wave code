@@ -1,0 +1,176 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from matplotlib.animation import FuncAnimation
+
+# Set random seeds for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# Problem parameters
+c = 1.0  # Wave speed
+L = 1.0  # Spatial domain [0, L]
+T = 2.0  # Time domain [0, T]
+
+# Neural network architecture
+def build_model():
+    inputs = tf.keras.Input(shape=(2,))
+    x = tf.keras.layers.Dense(50, activation='tanh')(inputs)
+    x = tf.keras.layers.Dense(50, activation='tanh')(x)
+    x = tf.keras.layers.Dense(50, activation='tanh')(x)
+    x = tf.keras.layers.Dense(50, activation='tanh')(x)
+    x = tf.keras.layers.Dense(50, activation='tanh')(x)
+    outputs = tf.keras.layers.Dense(1)(x)
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+model = build_model()
+
+# Wave equation residual
+def wave_equation_residual(x, t, model, c):
+    inputs = tf.concat([x, t], axis=1)
+    with tf.GradientTape(watch_accessed_variables=False, persistent=True) as tape:
+        tape.watch(inputs)
+        u = model(inputs)
+        du = tape.gradient(u, inputs)
+        du_dt = du[:, 1:2]
+        du_dx = du[:, 0:1]
+    d2u_dt2 = tape.gradient(du_dt, inputs)[:, 1:2]
+    d2u_dx2 = tape.gradient(du_dx, inputs)[:, 0:1]
+    del tape
+    residual = d2u_dt2 - c**2 * d2u_dx2
+    return residual
+
+# Training data preparation
+def prepare_data():
+    # Collocation points
+    x_col = np.random.uniform(0, L, (1000, 1)).astype(np.float32)
+    t_col = np.random.uniform(0, T, (1000, 1)).astype(np.float32)
+    X_col = np.hstack((x_col, t_col))
+    # Initial condition points
+    x_ic = np.linspace(0, L, 100)[:, None].astype(np.float32)
+    t_ic = np.zeros((100, 1), dtype=np.float32)
+    X_ic = np.hstack((x_ic, t_ic))
+    # Boundary condition points
+    t_bc = np.linspace(0, T, 100)[:, None].astype(np.float32)
+    x_bc_left = np.zeros((100, 1), dtype=np.float32)
+    x_bc_right = np.ones((100, 1), dtype=np.float32)
+    X_bc_left = np.hstack((x_bc_left, t_bc))
+    X_bc_right = np.hstack((x_bc_right, t_bc))
+    return X_col, X_ic, X_bc_left, X_bc_right
+
+X_col, X_ic_np, X_bc_left, X_bc_right = prepare_data()
+
+# Compute u_true_ic
+u_true_ic = np.sin(np.pi * X_ic_np[:, 0:1]).astype(np.float32)
+
+# Convert data to TensorFlow tensors
+X_col_tf = tf.convert_to_tensor(X_col, dtype=tf.float32)
+X_ic_tf = tf.convert_to_tensor(X_ic_np, dtype=tf.float32)
+X_bc_left_tf = tf.convert_to_tensor(X_bc_left, dtype=tf.float32)
+X_bc_right_tf = tf.convert_to_tensor(X_bc_right, dtype=tf.float32)
+
+# Loss function
+def loss(model, X_col, X_ic, X_bc_left, X_bc_right, c):
+    # PDE residual
+    x_col = X_col[:, 0:1]
+    t_col = X_col[:, 1:2]
+    residual = wave_equation_residual(x_col, t_col, model, c)
+    loss_pde = tf.reduce_mean(tf.square(residual))
+    # Initial conditions
+    u_pred_ic = model(X_ic)
+    loss_ic = tf.reduce_mean(tf.square(u_pred_ic - u_true_ic))
+    # Boundary conditions
+    u_pred_left = model(X_bc_left)
+    loss_bc_left = tf.reduce_mean(tf.square(u_pred_left))
+    u_pred_right = model(X_bc_right)
+    loss_bc_right = tf.reduce_mean(tf.square(u_pred_right))
+    # Total loss
+    loss_total = loss_pde + loss_ic + loss_bc_left + loss_bc_right
+    return {
+        'total': loss_total,
+        'pde': loss_pde,
+        'ic': loss_ic,
+        'bc_left': loss_bc_left,
+        'bc_right': loss_bc_right
+    }
+
+# Optimizer
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+
+# Training loop parameters
+epochs = 10000
+loss_history = []
+plot_epochs = 500
+
+print("Solving the 1D wave equation: d²u/dt² = c² d²u/dx²")
+
+for epoch in range(epochs):
+    with tf.GradientTape(persistent=True) as tape:
+        current_loss_dict = loss(model, X_col_tf, X_ic_tf, X_bc_left_tf, X_bc_right_tf, c)
+    gradients = tape.gradient(current_loss_dict['total'], model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    del tape
+    loss_history.append(current_loss_dict['total'].numpy())
+    if epoch % plot_epochs == 0:
+        current_loss_dict = loss(model, X_col_tf, X_ic_tf, X_bc_left_tf, X_bc_right_tf, c)
+        print(f'Epoch {epoch}, Loss: total={current_loss_dict["total"].numpy()}, '
+              f'pde={current_loss_dict["pde"].numpy()}, '
+              f'ic={current_loss_dict["ic"].numpy()}, '
+              f'bc_left={current_loss_dict["bc_left"].numpy()}, '
+              f'bc_right={current_loss_dict["bc_right"].numpy()}')
+
+# Evaluation grid
+x_star = np.linspace(0, L, 100).astype(np.float32)
+t_star = np.linspace(0, T, 100).astype(np.float32)
+X_star_x, X_star_t = np.meshgrid(x_star, t_star)
+X_star = np.hstack((X_star_x.flatten()[:, None], X_star_t.flatten()[:, None]))
+X_star_tensor = tf.convert_to_tensor(X_star, dtype=tf.float32)
+
+# Generate the solution on the evaluation grid
+U_star = model(X_star_tensor).numpy().reshape(100, 100)
+U_true = np.sin(np.pi * X_star_x) * np.cos(c * np.pi * X_star_t)
+
+# Create animation with static title
+fig, ax = plt.subplots(figsize=(10, 6))
+
+# Initialize plot
+u_true_t0 = U_true[:, 0]
+u_pred_t0 = U_star[:, 0]
+line_true, = ax.plot(x_star, u_true_t0, label='Exact Solution', linestyle='--')
+line_pred, = ax.plot(x_star, u_pred_t0, label='PINN Prediction')
+ax.scatter(X_ic_np[:, 0], u_true_ic[:, 0], label='Training Data', marker='x')
+ax.set_xlabel('Position x')
+ax.set_ylabel('Displacement u(x,t)')
+ax.set_title('Time Evolution of u(x,t)')  # Static title
+ax.legend()
+ax.set_ylim(-1.1, 1.1)
+ax.set_xlim(0, L)
+
+def update(frame):
+    u_true = U_true[:, frame]
+    u_pred = U_star[:, frame]
+    line_true.set_ydata(u_true)
+    line_pred.set_ydata(u_pred)
+    return line_true, line_pred  # No title update
+
+ani = FuncAnimation(fig, update, frames=len(t_star), interval=100, blit=True)
+plt.show()
+
+# Plot loss history
+plt.figure(figsize=(10,6))
+plt.plot(loss_history)
+plt.title('Loss History')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.show()
+
+# 3D surface plot
+fig = plt.figure(figsize=(12,8))
+ax = fig.add_subplot(111, projection='3d')
+ax.plot_surface(X_star_t, X_star_x, U_star, cmap='viridis')
+ax.set_xlabel('Time t')
+ax.set_ylabel('Position x')
+ax.set_zlabel('Displacement u(x,t)')
+ax.set_title('PINN Solution of 1D Wave Equation')
+plt.show()
