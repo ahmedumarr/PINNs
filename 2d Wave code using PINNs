@@ -1,0 +1,308 @@
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from mpl_toolkits.mplot3d import Axes3D
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Set random seeds for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# ========================
+# Display PDE Equation
+# ========================
+print("\n" + "="*60)
+print("Solving 2D Wave Equation using Physics-Informed Neural Networks")
+print("Equation: ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y²)")
+print("Domain: x ∈ [0,1], y ∈ [0,1], t ∈ [0,1]")
+print("Initial Conditions:")
+print("u(x,y,0) = sin(πx)sin(πy)")
+print("∂u/∂t(x,y,0) = 0")
+print("Boundary Conditions: u(0,y,t) = u(1,y,t) = u(x,0,t) = u(x,1,t) = 0")
+print("="*60 + "\n")
+
+# ========================
+# Neural Network Definition
+# ========================
+def build_model():
+    return tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(3,)),
+        tf.keras.layers.Dense(128, activation='tanh'),
+        tf.keras.layers.Dense(128, activation='tanh'),
+        tf.keras.layers.Dense(128, activation='tanh'),
+        tf.keras.layers.Dense(1)
+    ])
+
+model = build_model()
+
+# ========================
+# Physics-Informed Components
+# ========================
+def compute_gradients(model, x, y, t):
+    with tf.GradientTape(persistent=True) as tape2:
+        tape2.watch([x, y, t])
+        with tf.GradientTape(persistent=True) as tape1:
+            tape1.watch([x, y, t])
+            u = model(tf.concat([x, y, t], axis=1))
+
+        u_x = tape1.gradient(u, x)
+        u_y = tape1.gradient(u, y)
+        u_t = tape1.gradient(u, t)
+
+    u_xx = tape2.gradient(u_x, x)
+    u_yy = tape2.gradient(u_y, y)
+    u_tt = tape2.gradient(u_t, t)
+
+    del tape1, tape2
+    return u, u_xx, u_yy, u_tt
+
+# ========================
+# Loss Function (Stable Version)
+# ========================
+def calculate_loss(model, x, y, t, x_bnd, y_bnd, t_bnd, x_ic, y_ic, t_ic):
+    # PDE Residual
+    _, u_xx, u_yy, u_tt = compute_gradients(model, x, y, t)
+    pde_loss = tf.reduce_mean(tf.square(u_tt - (u_xx + u_yy)))
+
+    # Boundary Conditions
+    u_bnd = model(tf.concat([x_bnd, y_bnd, t_bnd], axis=1))
+    bnd_loss = tf.reduce_mean(tf.square(u_bnd))
+
+    # Initial Conditions
+    u_ic = model(tf.concat([x_ic, y_ic, t_ic], axis=1))
+    u_ic_exact = tf.sin(np.pi * x_ic) * tf.sin(np.pi * y_ic)
+    ic_u_loss = tf.reduce_mean(tf.square(u_ic - u_ic_exact))
+
+    # Initial Velocity (Numerical differentiation)
+    h = 1e-3
+    u_ic_perturbed = model(tf.concat([x_ic, y_ic, t_ic + h], axis=1))
+    ic_v_loss = tf.reduce_mean(tf.square((u_ic_perturbed - u_ic) / h))
+
+    return pde_loss + bnd_loss + ic_u_loss + ic_v_loss
+
+# ========================
+# Data Preparation
+# ========================
+def generate_data(n_samples):
+    # Collocation points
+    x_col = np.random.uniform(0, 1, (n_samples, 1))
+    y_col = np.random.uniform(0, 1, (n_samples, 1))
+    t_col = np.random.uniform(0, 1, (n_samples, 1))
+
+    # Boundary points
+    n_bnd = n_samples // 4
+    x_bnd = np.vstack([
+        np.zeros((n_bnd, 1)),
+        np.ones((n_bnd, 1)),
+        np.random.uniform(0, 1, (n_bnd, 1)),
+        np.random.uniform(0, 1, (n_bnd, 1))
+    ])
+    y_bnd = np.vstack([
+        np.random.uniform(0, 1, (n_bnd, 1)),
+        np.random.uniform(0, 1, (n_bnd, 1)),
+        np.zeros((n_bnd, 1)),
+        np.ones((n_bnd, 1))
+    ])
+    t_bnd = np.random.uniform(0, 1, (4*n_bnd, 1))
+
+    # Initial condition points
+    x_ic = np.random.uniform(0, 1, (n_samples, 1))
+    y_ic = np.random.uniform(0, 1, (n_samples, 1))
+    t_ic = np.zeros_like(x_ic)
+
+    return (
+        tf.convert_to_tensor(x_col, dtype=tf.float32),
+        tf.convert_to_tensor(y_col, dtype=tf.float32),
+        tf.convert_to_tensor(t_col, dtype=tf.float32),
+        tf.convert_to_tensor(x_bnd, dtype=tf.float32),
+        tf.convert_to_tensor(y_bnd, dtype=tf.float32),
+        tf.convert_to_tensor(t_bnd, dtype=tf.float32),
+        tf.convert_to_tensor(x_ic, dtype=tf.float32),
+        tf.convert_to_tensor(y_ic, dtype=tf.float32),
+        tf.convert_to_tensor(t_ic, dtype=tf.float32)
+    )
+
+# Generate training data
+x_col, y_col, t_col, x_bnd, y_bnd, t_bnd, x_ic, y_ic, t_ic = generate_data(10000)
+
+# ========================
+# Training Loop
+# ========================
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+loss_history = []
+
+@tf.function
+def train_step():
+    with tf.GradientTape() as tape:
+        loss_value = calculate_loss(model, x_col, y_col, t_col,
+                                  x_bnd, y_bnd, t_bnd,
+                                  x_ic, y_ic, t_ic)
+    gradients = tape.gradient(loss_value, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    return loss_value
+
+for epoch in range(500):
+    loss_value = train_step()
+    loss_history.append(loss_value.numpy())
+
+    if epoch % 250 == 0:
+        print(f"Epoch {epoch:5d} - Loss: {loss_value.numpy():.4e}")
+
+# ========================
+# Visualization Section (Fixed)
+# ========================
+# Generate prediction grid
+x_plot = np.linspace(0, 1, 50)
+y_plot = np.linspace(0, 1, 50)
+t_plot = np.linspace(0, 1, 100)
+
+# Create 2D spatial grid for visualization
+X_2D, Y_2D = np.meshgrid(x_plot, y_plot)
+
+# Create 3D prediction grid
+X, Y, T = np.meshgrid(x_plot, y_plot, t_plot)
+grid_points = np.hstack([X.reshape(-1,1), Y.reshape(-1,1), T.reshape(-1,1)])
+
+# Predictions
+u_pred = model.predict(grid_points, batch_size=10000).reshape(50, 50, 100)
+u_exact = np.sin(np.pi*X) * np.sin(np.pi*Y) * np.cos(np.pi*np.sqrt(2)*T)
+error = u_pred - u_exact
+
+# ========================
+# Enhanced Visualization Functions (Fixed)
+# ========================
+def create_3d_subplots(data_dict, t_indices):
+    fig = plt.figure(figsize=(18, 12))
+    for idx, t_idx in enumerate(t_indices):
+        # Predicted Solution
+        ax1 = fig.add_subplot(3, 5, idx+1, projection='3d')
+        surf1 = ax1.plot_surface(X_2D, Y_2D, data_dict['pred'][:,:,t_idx],
+                                cmap='viridis', vmin=-1, vmax=1)
+        ax1.set_title(f'Predicted @ t={t_plot[t_idx]:.2f}')
+        ax1.set_zlim(-1, 1)
+
+        # Exact Solution
+        ax2 = fig.add_subplot(3, 5, idx+6, projection='3d')
+        surf2 = ax2.plot_surface(X_2D, Y_2D, data_dict['exact'][:,:,t_idx],
+                                cmap='viridis', vmin=-1, vmax=1)
+        ax2.set_title(f'Exact @ t={t_plot[t_idx]:.2f}')
+        ax2.set_zlim(-1, 1)
+
+        # Error Surface
+        ax3 = fig.add_subplot(3, 5, idx+11, projection='3d')
+        surf3 = ax3.plot_surface(X_2D, Y_2D, data_dict['error'][:,:,t_idx],
+                                cmap='coolwarm', vmin=-0.5, vmax=0.5)
+        ax3.set_title(f'Error @ t={t_plot[t_idx]:.2f}')
+        ax3.set_zlim(-0.5, 0.5)
+
+    plt.tight_layout()
+    return fig
+
+def calculate_error_metrics(u_pred, u_exact):
+    metrics = {
+        'Relative L2 Error': np.linalg.norm(u_pred - u_exact) / np.linalg.norm(u_exact),
+        'Max Absolute Error': np.max(np.abs(u_pred - u_exact)),
+        'RMSE': np.sqrt(mean_squared_error(u_exact.flatten(), u_pred.flatten())),
+        'R-squared': r2_score(u_exact.flatten(), u_pred.flatten())
+    }
+    return metrics
+
+# ========================
+# Enhanced Visualization Execution
+# ========================
+# Original Visualizations
+plt.figure(figsize=(10,6))
+plt.semilogy(loss_history)
+plt.title("Training Loss History")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.show()
+
+# Enhanced 3D Comparison Plots
+time_indices = [0, 25, 50, 75, 99]
+data_dict = {'pred': u_pred, 'exact': u_exact, 'error': error}
+fig_3d = create_3d_subplots(data_dict, time_indices)
+plt.show()
+
+# Error Metrics Table
+print("\nGlobal Error Metrics:")
+metrics = calculate_error_metrics(u_pred, u_exact)
+for key, value in metrics.items():
+    print(f"{key+':':<20} {value:.4e}")
+
+# Enhanced Error Analysis
+plt.figure(figsize=(12, 8))
+
+plt.subplot(2, 2, 1)
+plt.plot(t_plot, np.max(np.abs(error), axis=(0,1)), label='Max Error')
+plt.plot(t_plot, np.mean(np.abs(error), axis=(0,1)), label='Mean Error')
+plt.title("Absolute Error Evolution")
+plt.xlabel("Time")
+plt.ylabel("Error Magnitude")
+plt.legend()
+
+plt.subplot(2, 2, 2)
+rel_error = np.linalg.norm(error, axis=(0,1)) / np.linalg.norm(u_exact, axis=(0,1))
+plt.plot(t_plot, rel_error)
+plt.title("Relative L2 Error Evolution")
+plt.xlabel("Time")
+plt.ylabel("Relative Error")
+
+plt.subplot(2, 2, 3)
+plt.hist(error.flatten(), bins=50, density=True)
+plt.title("Error Distribution Histogram")
+plt.xlabel("Error Value")
+plt.ylabel("Density")
+
+plt.subplot(2, 2, 4, projection='3d')
+surf = plt.gca().plot_surface(X_2D, Y_2D, error[:,:,-1],
+                            cmap='coolwarm', vmin=-0.5, vmax=0.5)
+plt.title("Final Time Step Error Surface")
+plt.colorbar(surf)
+
+plt.tight_layout()
+plt.show()
+
+# Enhanced 3D Error Animation
+def create_enhanced_error_animation(error_data):
+    fig = plt.figure(figsize=(10,8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    def animate(i):
+        ax.clear()
+        surf = ax.plot_surface(X_2D, Y_2D, error_data[:,:,i],
+                              cmap='coolwarm', vmin=-0.5, vmax=0.5)
+        ax.set_zlim(-0.5, 0.5)
+        ax.set_title(f"Error Propagation\nTime: {t_plot[i]:.2f}")
+        return surf,
+
+    ani = animation.FuncAnimation(fig, animate, frames=50, interval=100)
+    plt.close()
+    return ani
+
+# Create and display animations
+def create_3d_animation(data, title):
+    fig = plt.figure(figsize=(10,8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    def animate(i):
+        ax.clear()
+        surf = ax.plot_surface(X_2D, Y_2D, data[:,:,i],
+                             cmap='viridis', vmin=-1, vmax=1)
+        ax.set_zlim(-1, 1)
+        ax.set_title(f"{title}\nTime: {t_plot[i]:.2f}")
+        return surf,
+
+    ani = animation.FuncAnimation(fig, animate, frames=50, interval=100)
+    plt.close()
+    return ani
+
+ani_pred = create_3d_animation(u_pred, "Predicted Solution")
+ani_exact = create_3d_animation(u_exact, "Exact Solution")
+ani_error = create_enhanced_error_animation(error)
+
+from IPython.display import HTML
+HTML(ani_pred.to_jshtml())
+HTML(ani_exact.to_jshtml())
+HTML(ani_error.to_jshtml())
