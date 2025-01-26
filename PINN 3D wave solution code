@@ -1,0 +1,397 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D
+from sklearn.metrics import mean_squared_error, r2_score
+import time
+
+# ======================================================================
+#                       PHYSICAL PROBLEM SETUP
+# ======================================================================
+"""
+3D Wave Equation Specification:
+    PDE: ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y² + ∂²u/∂z²)
+    
+    Domain:
+        Space: [0, 1]³
+        Time:  [0, 1]
+    
+    Initial Conditions:
+        u(x,y,z,0) = sin(πx)sin(πy)sin(πz)
+        ∂u/∂t(x,y,z,0) = 0
+    
+    Boundary Conditions:
+        u(0,y,z,t) = u(1,y,z,t) = 0
+        u(x,0,z,t) = u(x,1,z,t) = 0
+        u(x,y,0,t) = u(x,y,1,t) = 0
+"""
+
+# Configuration
+class Config:
+    # Physical parameters
+    WAVE_SPEED = 1.0
+    DOMAIN = [0.0, 1.0]
+    
+    # Network parameters
+    LAYERS = [4, 256, 256, 256, 1]
+    LR = 0.001
+    EPOCHS = 4000
+    BATCH_SIZE = 4096
+    
+    # Numerical parameters
+    RESOLUTION = 30
+    TIME_STEPS = 50
+    TRAIN_SAMPLES = 10000
+    SEED = 42
+
+# Set random seeds
+torch.manual_seed(Config.SEED)
+np.random.seed(Config.SEED)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ======================================================================
+#                       NEURAL NETWORK ARCHITECTURE
+# ======================================================================
+class WaveNet(nn.Module):
+    def __init__(self):
+        super(WaveNet, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(4, 256), nn.Tanh(),
+            nn.Linear(256, 256), nn.Tanh(),
+            nn.Linear(256, 256), nn.Tanh(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ======================================================================
+#                       PHYSICS-INFORMED COMPONENTS
+# ======================================================================
+def compute_gradients(model, inputs):
+    inputs = inputs.requires_grad_(True)
+    u = model(inputs)
+    
+    # First derivatives
+    grad_u = torch.autograd.grad(u, inputs, 
+                               grad_outputs=torch.ones_like(u),
+                               create_graph=True,
+                               retain_graph=True)[0]
+    
+    # Second derivatives
+    u_x, u_y, u_z, u_t = grad_u[:,0], grad_u[:,1], grad_u[:,2], grad_u[:,3]
+    
+    u_xx = torch.autograd.grad(u_x.sum(), inputs, create_graph=True, retain_graph=True)[0][:,0]
+    u_yy = torch.autograd.grad(u_y.sum(), inputs, create_graph=True, retain_graph=True)[0][:,1]
+    u_zz = torch.autograd.grad(u_z.sum(), inputs, create_graph=True, retain_graph=True)[0][:,2]
+    u_tt = torch.autograd.grad(u_t.sum(), inputs, create_graph=True, retain_graph=True)[0][:,3]
+    
+    return u, u_xx, u_yy, u_zz, u_tt
+
+class PhysicsLoss(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+
+    def forward(self, model, data):
+        x, y, z, t, bnd_points, ic_points = data
+        inputs = torch.cat([x, y, z, t], dim=1)
+        
+        # PDE Residual
+        u_pred, u_xx, u_yy, u_zz, u_tt = compute_gradients(model, inputs)
+        pde_loss = torch.mean((u_tt - (self.c**2)*(u_xx + u_yy + u_zz))**2)
+        
+        # Boundary Conditions
+        u_bnd = model(bnd_points)
+        bnd_loss = torch.mean(u_bnd**2)
+        
+        # Initial Conditions
+        u_ic = model(ic_points)
+        exact_ic = torch.prod(torch.sin(torch.pi * ic_points[:,:3]), dim=1, keepdim=True)
+        ic_u_loss = torch.mean((u_ic - exact_ic)**2)
+        
+        # Initial Velocity
+        h = 1e-3
+        ic_perturbed = ic_points.clone()
+        ic_perturbed[:,3] += h
+        u_ic_p = model(ic_perturbed)
+        ic_v_loss = torch.mean(((u_ic_p - u_ic)/h)**2)
+        
+        return (10*pde_loss + 5*bnd_loss + 2*ic_u_loss + 2*ic_v_loss,
+                [pde_loss.item(), bnd_loss.item(), ic_u_loss.item(), ic_v_loss.item()])
+
+# ======================================================================
+#                       DATA GENERATION
+# ======================================================================
+class DataGenerator:
+    def generate(self, n_samples):
+        # Collocation points
+        x = torch.rand(n_samples, 1, device=device)
+        y = torch.rand(n_samples, 1, device=device)
+        z = torch.rand(n_samples, 1, device=device)
+        t = torch.rand(n_samples, 1, device=device)
+        
+        # Boundary points (6 faces)
+        boundaries = []
+        n_per_face = n_samples // 6
+        for dim in range(3):
+            for val in [0.0, 1.0]:
+                components = [torch.rand(n_per_face, 1, device=device) for _ in range(3)]
+                components[dim] = torch.full((n_per_face,1), val, device=device)
+                t_vals = torch.rand(n_per_face, 1, device=device)
+                pts = torch.cat(components + [t_vals], dim=1)
+                boundaries.append(pts)
+                
+        bnd_points = torch.cat(boundaries, dim=0)
+        
+        # Initial conditions
+        ic_points = torch.cat([
+            torch.rand(n_samples, 3, device=device),
+            torch.zeros(n_samples, 1, device=device)
+        ], dim=1)
+        
+        return (x, y, z, t, bnd_points, ic_points)
+
+# ======================================================================
+#                       TRAINING SYSTEM
+# ======================================================================
+class Trainer:
+    def __init__(self):
+        self.model = WaveNet().to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=Config.LR)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=100)
+        self.data_gen = DataGenerator()
+        self.loss_fn = PhysicsLoss(Config.WAVE_SPEED)
+        
+    def train(self):
+        train_data = self.data_gen.generate(Config.TRAIN_SAMPLES)
+        val_data = self.data_gen.generate(Config.TRAIN_SAMPLES//5)
+        
+        best_loss = float('inf')
+        train_losses, val_losses = [], []
+        loss_components = []
+        
+        for epoch in range(Config.EPOCHS):
+            # Training step
+            self.model.train()
+            self.optimizer.zero_grad()
+            
+            loss, components = self.loss_fn(self.model, train_data)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            # Validation - Removed torch.no_grad() to retain gradients for PDE computation
+            self.model.eval()
+            val_loss, _ = self.loss_fn(self.model, val_data)
+            
+            # Track metrics
+            train_losses.append(loss.item())
+            val_losses.append(val_loss.item())
+            loss_components.append(components)
+            
+            # Update scheduler
+            self.scheduler.step(val_loss)
+            
+            # Save best model
+            if val_loss < best_loss:
+                best_loss = val_loss
+                torch.save(self.model.state_dict(), 'best_model.pth')
+            
+            if epoch % 1000 == 0:
+                lr = self.optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch:5d} | Train Loss: {loss.item():.2e} | Val Loss: {val_loss.item():.2e} | LR: {lr:.1e}")
+        
+        return train_losses, val_losses, loss_components
+
+# ======================================================================
+#                       VISUALIZATION SYSTEM
+# ======================================================================
+class Visualizer:
+    def __init__(self, model):
+        self.model = model
+        self.x = np.linspace(0, 1, Config.RESOLUTION)
+        self.y = np.linspace(0, 1, Config.RESOLUTION)
+        self.z = 0.5  # Fixed z-plane for visualization
+        self.t = np.linspace(0, 1, Config.TIME_STEPS)
+        
+    def _predict(self, t):
+        X, Y = np.meshgrid(self.x, self.y)
+        Z = np.full_like(X, self.z)
+        T = np.full_like(X, t)
+        
+        grid = torch.tensor(np.stack([X, Y, Z, T], axis=-1), 
+                          dtype=torch.float32, device=device)
+        with torch.no_grad():
+            u_pred = self.model(grid.view(-1,4)).cpu().numpy().reshape(X.shape)
+            u_exact = (np.sin(np.pi*X) * np.sin(np.pi*Y) * np.sin(np.pi*Z) *
+                      np.cos(np.pi*np.sqrt(3)*Config.WAVE_SPEED*t))
+        
+        return X, Y, u_pred, u_exact
+    
+    def plot_training_history(self, train_loss, val_loss):
+        plt.figure(figsize=(10,6))
+        plt.semilogy(train_loss, label='Training Loss')
+        plt.semilogy(val_loss, label='Validation Loss')
+        plt.title("Training History")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        
+    def plot_loss_components(self, components):
+        components = np.array(components)
+        labels = ['PDE Loss', 'Boundary Loss', 'IC Displacement', 'IC Velocity']
+        
+        plt.figure(figsize=(12,6))
+        for i in range(4):
+            plt.semilogy(components[:,i], label=labels[i], alpha=0.8)
+        plt.title("Loss Component Evolution")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss Value")
+        plt.legend()
+        plt.grid(True, which='both', linestyle='--')
+        plt.show()
+    
+    def plot_solution_snapshots(self):
+        times = [0.0, 0.25, 0.5, 0.75, 1.0]
+        fig = plt.figure(figsize=(20, 12))
+        
+        for i, t in enumerate(times):
+            X, Y, pred, exact = self._predict(t)
+            error = pred - exact
+            
+            # Predicted
+            ax = fig.add_subplot(3, len(times), i+1, projection='3d')
+            ax.plot_surface(X, Y, pred, cmap='viridis')
+            ax.set_title(f'Predicted @ t={t:.2f}')
+            ax.set_zlim(-1, 1)
+            
+            # Exact
+            ax = fig.add_subplot(3, len(times), i+1+len(times), projection='3d')
+            ax.plot_surface(X, Y, exact, cmap='viridis')
+            ax.set_title(f'Exact @ t={t:.2f}')
+            ax.set_zlim(-1, 1)
+            
+            # Error
+            ax = fig.add_subplot(3, len(times), i+1+2*len(times), projection='3d')
+            ax.plot_surface(X, Y, error, cmap='coolwarm')
+            ax.set_title(f'Error @ t={t:.2f}')
+            ax.set_zlim(-0.5, 0.5)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_error_propagation(self):
+        time_points = np.linspace(0, 1, 6)
+        rmse_vals, max_err_vals = [], []
+        
+        plt.figure(figsize=(15,6))
+        
+        for i, t in enumerate(time_points):
+            X, Y, pred, exact = self._predict(t)
+            error = pred - exact
+            
+            # Error surface
+            ax = plt.subplot(2, 3, i+1, projection='3d')
+            ax.plot_surface(X, Y, error, cmap='coolwarm')
+            ax.set_title(f't = {t:.2f}')
+            ax.set_zlim(-0.5, 0.5)
+            
+            # Track metrics
+            rmse_vals.append(np.sqrt(mean_squared_error(exact, pred)))
+            max_err_vals.append(np.max(np.abs(error)))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Error metrics plot
+        plt.figure(figsize=(12,5))
+        plt.plot(time_points, rmse_vals, 'o-', label='RMSE')
+        plt.plot(time_points, max_err_vals, 's-', label='Max Error')
+        plt.title("Error Propagation Over Time")
+        plt.xlabel("Time")
+        plt.ylabel("Error Magnitude")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    
+    def plot_final_time_analysis(self):
+        X, Y, pred, exact = self._predict(1.0)
+        error = pred - exact
+        
+        fig = plt.figure(figsize=(18,6))
+        
+        # Predicted
+        ax1 = fig.add_subplot(131, projection='3d')
+        ax1.plot_surface(X, Y, pred, cmap='viridis')
+        ax1.set_title('Final Predicted Solution')
+        ax1.set_zlim(-1, 1)
+        
+        # Exact
+        ax2 = fig.add_subplot(132, projection='3d')
+        ax2.plot_surface(X, Y, exact, cmap='viridis')
+        ax2.set_title('Final Exact Solution')
+        ax2.set_zlim(-1, 1)
+        
+        # Error
+        ax3 = fig.add_subplot(133, projection='3d')
+        surf = ax3.plot_surface(X, Y, error, cmap='coolwarm')
+        fig.colorbar(surf, ax=ax3, shrink=0.5)
+        ax3.set_title('Final Error Distribution')
+        ax3.set_zlim(-0.5, 0.5)
+        
+        plt.tight_layout()
+        plt.show()
+
+# ======================================================================
+#                       MAIN EXECUTION
+# ======================================================================
+if __name__ == "__main__":
+    # Display problem specification
+    print("="*60)
+    print("Solving 3D Wave Equation with Physics-Informed Neural Networks")
+    print("="*60)
+    print("\nEquation:")
+    print("∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y² + ∂²u/∂z²)")
+    print(f"Wave speed c = {Config.WAVE_SPEED}")
+    print("\nDomain:")
+    print(f"Space: [{Config.DOMAIN[0]}, {Config.DOMAIN[1]}]³")
+    print("Time:  [0, 1]")
+    print("\nInitial Conditions:")
+    print("u(x,y,z,0) = sin(πx)sin(πy)sin(πz)")
+    print("∂u/∂t(x,y,z,0) = 0")
+    print("\nBoundary Conditions:")
+    print("Dirichlet: u = 0 on all spatial boundaries")
+    print("="*60 + "\n")
+
+    # Training
+    print("Starting training...")
+    start_time = time.time()
+    trainer = Trainer()
+    train_loss, val_loss, loss_components = trainer.train()
+    print(f"\nTraining completed in: {time.time()-start_time:.2f} seconds")
+
+    # Load best model
+    trainer.model.load_state_dict(torch.load('best_model.pth'))
+
+    # Visualization and analysis
+    viz = Visualizer(trainer.model)
+    
+    print("\nGenerating visualizations...")
+    viz.plot_training_history(train_loss, val_loss)
+    viz.plot_loss_components(loss_components)
+    viz.plot_solution_snapshots()
+    viz.plot_error_propagation()
+    viz.plot_final_time_analysis()
+
+    # Final error report
+    print("\nFinal Error Metrics:")
+    X, Y, pred, exact = viz._predict(1.0)
+    print(f"RMSE: {np.sqrt(mean_squared_error(exact, pred)):.4e}")
+    print(f"R² Score: {r2_score(exact.flatten(), pred.flatten()):.4f}")
+    print(f"Max Absolute Error: {np.max(np.abs(pred - exact)):.4e}")
