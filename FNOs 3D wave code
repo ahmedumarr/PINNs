@@ -1,0 +1,179 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import imageio
+from scipy.ndimage import gaussian_filter
+
+# Equation being solved
+print("3D Wave Equation:")
+print("∂²u/∂t² = c²∇²u\n")
+
+class FNO3d(nn.Module):
+    def __init__(self, modes1, modes2, modes3, width):
+        super(FNO3d, self).__init__()
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.modes3 = modes3
+        self.width = width
+        self.fc0 = nn.Linear(4, self.width)
+        self.convs = nn.ModuleList([FNOBlock(self.modes1, self.modes2, self.modes3, self.width) for _ in range(4)])
+        self.fc1 = nn.Linear(self.width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for conv in self.convs:
+            x = conv(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        return x
+
+class FNOBlock(nn.Module):
+    def __init__(self, modes1, modes2, modes3, width):
+        super(FNOBlock, self).__init__()
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.modes3 = modes3
+        self.width = width
+        self.conv = nn.Conv3d(self.width, self.width, 1)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        x_fft = torch.fft.fftn(x, dim=[2, 3, 4])
+        x_fft = x_fft[:, :, :self.modes1, :self.modes2, :self.modes3]
+        x_real = x_fft.real
+        x_imag = x_fft.imag
+        x_real = self.conv(x_real)
+        x_imag = self.conv(x_imag)
+        x_fft = torch.complex(x_real, x_imag)
+        x_fft = F.pad(x_fft, (0, x.shape[4]-self.modes3, 0, x.shape[3]-self.modes2, 0, x.shape[2]-self.modes1))
+        x = torch.fft.ifftn(x_fft, dim=[2, 3, 4]).real
+        return x
+
+def create_animation(data, filename="wave.gif"):
+    frames = []
+    for i in range(data.shape[0]):
+        # Take 2D slice from 3D data (z=16)
+        frame_slice = data[i, :, :, 16]
+        # Normalize the slice
+        frame = (frame_slice - data.min()) / (data.max() - data.min()) * 255
+        frames.append(frame.astype(np.uint8))
+    imageio.mimsave(filename, frames, duration=0.1)
+
+def plot_results(data, title):
+    plt.figure(figsize=(10, 6))
+    plt.imshow(data[:, :, 16], cmap='viridis', aspect='auto')
+    plt.colorbar()
+    plt.title(title)
+    plt.show()
+
+def calculate_error(y_true, y_pred):
+    rmse = np.sqrt(np.mean((y_true.flatten() - y_pred.flatten())**2))
+    mae = np.mean(np.abs(y_true - y_pred))
+    return rmse, mae
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = FNO3d(16, 16, 16, 32).to(device)
+
+    # Synthetic dataset
+    train_data = torch.randn(100, 32, 32, 32, 4).to(device)
+    train_targets = torch.randn(100, 32, 32, 32, 1).to(device)
+    train_loader = [(train_data[i:i+10], train_targets[i:i+10]) for i in range(0, 100, 10)]
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    training_losses = []
+    for epoch in range(150):
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            training_losses.append(loss.item())
+        print(f"Epoch {epoch+1}, Loss: {loss.item()}")
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(training_losses, label='Training Loss', color='red')
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.title('Training Loss History')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    input_data = torch.randn(10, 32, 32, 32, 4).to(device)
+    output = model(input_data)
+
+    # Result 1: 3D Wavefield Visualization
+    plot_results(output[0, :, :, :, 0].detach().cpu().numpy(), "3D Wavefield Slice (z=16)")
+
+    # Result 2: Animation
+    create_animation(output[:, :, :, :, 0].detach().cpu().numpy(), "wave.gif")
+
+    # Result 3: Multiple Predictions
+    fig, axs = plt.subplots(2, 3, figsize=(15, 8))
+    for i, ax in enumerate(axs.flat[:6]):
+        ax.imshow(output[i, :, :, 16, 0].detach().cpu().numpy(), cmap='viridis')
+        ax.set_title(f"Sample {i+1}")
+    plt.tight_layout()
+    plt.show()
+
+    # Result 4: Smoothed Wavefield
+    smoothed = gaussian_filter(output[0, :, :, :, 0].detach().cpu().numpy(), sigma=1)
+    plot_results(smoothed, "Smoothed Wavefield (z=16)")
+
+    # Result 5: Time Series Analysis
+    timeseries = output[0, 16, 16, :, 0].detach().cpu().numpy()
+    plt.figure(figsize=(10, 4))
+    plt.plot(timeseries)
+    plt.title("Time Series at (16,16,z)")
+    plt.xlabel("Z Position")
+    plt.ylabel("Amplitude")
+    plt.grid()
+    plt.show()
+
+    # Additional Results
+
+    # Result 6: Error Metrics
+    y_pred = output.detach().cpu().numpy()
+    y_true = train_targets.detach().cpu().numpy()[:10]
+    rmse, mae = calculate_error(y_true, y_pred)
+    print(f"RMSE: {rmse:.4f}, MAE: {mae:.4f}")
+
+    # Result 7: Frequency Domain Analysis
+    fft_data = np.fft.fftn(y_pred[0, :, :, :, 0])
+    freq = np.fft.fftfreq(32)
+    plt.figure(figsize=(8, 4))
+    plt.semilogy(freq[:16], np.abs(fft_data[:, 16, 16])[:16])  # Plot only positive frequencies
+    plt.xlabel("Frequency")
+    plt.title("Frequency Spectrum at (16,16,z)")
+    plt.show()
+
+    # Result 8: 3D Surface Plot
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    X, Y = np.meshgrid(np.arange(32), np.arange(32))
+    Z = output[0, :, :, 16, 0].detach().cpu().numpy()
+    ax.plot_surface(X, Y, Z, cmap='viridis')
+    plt.title("3D Surface Plot at z=16")
+    plt.show()
+
+    # Result 9: Model Summary
+    print("Model Architecture:")
+    print(model)
+
+    # Result 10: Dataset Statistics
+    print(f"\nDataset Shape: {train_data.shape}")
+    print(f"Output Shape: {output.shape}")
+
+if __name__ == "__main__":
+    main()
